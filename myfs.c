@@ -64,6 +64,59 @@ int myFSIsIdle(Disk *d)
 	return 1;  // Nenhum arquivo aberto, sistema OCIOSO
 }
 
+// Funcao auxiliar para alocar um bloco livre no disco
+// Retorna o setor inicial do bloco alocado, ou 0 se nenhum bloco livre
+static unsigned int allocateFreeBlock(Disk *d)
+{
+	if (d == NULL || sb.magic != MYFS_MAGIC) {
+		printf("[DEBUG allocateFreeBlock] ERRO: Disco ou superbloco inválido\n");
+		return 0;
+	}
+
+	unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
+	unsigned int totalBlocks = sb.numBlocks;
+	unsigned int dataBlockStart = sb.dataBlockStart;
+
+	printf("[DEBUG allocateFreeBlock] Procurando bloco livre (total: %u blocos)\n", totalBlocks);
+
+	// Criar um array para rastrear blocos usados
+	// Verificar todos os inodes e marcar blocos alocados
+	unsigned char usedBlocks[totalBlocks];
+	memset(usedBlocks, 0, sizeof(usedBlocks));
+
+	// Percorrer todos os inodes possíveis e marcar seus blocos como usados
+	for (unsigned int inodeNum = 1; inodeNum <= sb.numInodes; inodeNum++) {
+		Inode *checkInode = inodeLoad(inodeNum, d);
+		if (checkInode != NULL) {
+			// Marcar blocos deste inode como usados
+			unsigned int numBlocksInInode = inodeNumBlockAddresses();
+			for (unsigned int i = 0; i < numBlocksInInode; i++) {
+				unsigned int blockAddr = inodeGetBlockAddr(checkInode, i);
+				if (blockAddr > 0) {
+					// Calcular número do bloco a partir do setor
+					unsigned int blockNum = (blockAddr - dataBlockStart) / sectorsPerBlock;
+					if (blockNum < totalBlocks) {
+						usedBlocks[blockNum] = 1;
+					}
+				}
+			}
+			free(checkInode);
+		}
+	}
+
+	// Encontrar primeiro bloco não usado
+	for (unsigned int blockNum = 0; blockNum < totalBlocks; blockNum++) {
+		if (usedBlocks[blockNum] == 0) {
+			unsigned int blockSector = dataBlockStart + (blockNum * sectorsPerBlock);
+			printf("[DEBUG allocateFreeBlock] Alocando bloco %u no setor %u\n", blockNum, blockSector);
+			return blockSector;
+		}
+	}
+
+	printf("[DEBUG allocateFreeBlock] ERRO: Nenhum bloco livre encontrado\n");
+	return 0; // Nenhum bloco livre
+}
+
 // Funcao para formatacao de um disco com o novo sistema de arquivos
 // com tamanho de blocos igual a blockSize. Retorna o numero total de
 // blocos disponiveis no disco, se formatado com sucesso. Caso contrario,
@@ -358,12 +411,13 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 
 	// Obter informações do descritor
 	Inode *inode = fdTable[idx].inode;
-	if (inode == NULL) {
-		printf("[DEBUG myFSRead] ERRO: Inode não carregado\n");
+	Disk *disk = fdTable[idx].disk;
+	if (inode == NULL || disk == NULL) {
+		printf("[DEBUG myFSRead] ERRO: Inode ou disco não carregado\n");
 		return -1;
 	}
 
-	// Obter tamanho do arquivo (assumindo que está armazenado no inode)
+	// Obter tamanho do arquivo
 	unsigned int fileSize = inodeGetFileSize(inode);
 	unsigned int cursor = fdTable[idx].cursor;
 
@@ -383,18 +437,48 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 
 	printf("[DEBUG myFSRead] Bytes a ler: %u\n", bytesToRead);
 
-	// Ler dados do inode
-	int bytesRead = inodeRead(inode, buf, cursor, bytesToRead);
-	if (bytesRead < 0) {
-		printf("[DEBUG myFSRead] ERRO: Falha ao ler dados do inode\n");
-		return -1;
+	// Ler dados bloco por bloco
+	unsigned int totalRead = 0;
+	unsigned int blockSize = sb.blockSize; // Tamanho do bloco do superbloco
+
+	while (totalRead < bytesToRead) {
+		// Calcular bloco e offset dentro do bloco
+		unsigned int currentPos = cursor + totalRead;
+		unsigned int blockNum = currentPos / blockSize;
+		unsigned int offsetInBlock = currentPos % blockSize;
+
+		// Obter endereço do bloco
+		unsigned int blockAddr = inodeGetBlockAddr(inode, blockNum);
+		if (blockAddr == 0) {
+			printf("[DEBUG myFSRead] AVISO: Bloco %u não alocado\n", blockNum);
+			break; // Bloco não alocado
+		}
+
+		// Ler bloco do disco
+		unsigned char blockData[blockSize];
+		unsigned int numSectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
+			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+				printf("[DEBUG myFSRead] ERRO: Falha ao ler setor %u\n", blockAddr + i);
+				return -1;
+			}
+		}
+
+		// Copiar dados do bloco para o buffer
+		unsigned int bytesFromBlock = blockSize - offsetInBlock;
+		if (bytesFromBlock > bytesToRead - totalRead) {
+			bytesFromBlock = bytesToRead - totalRead;
+		}
+
+		memcpy(buf + totalRead, blockData + offsetInBlock, bytesFromBlock);
+		totalRead += bytesFromBlock;
 	}
 
 	// Atualizar cursor
-	fdTable[idx].cursor += bytesRead;
+	fdTable[idx].cursor += totalRead;
 
-	printf("[DEBUG myFSRead] Sucesso: %d bytes lidos, novo cursor: %u\n", bytesRead, fdTable[idx].cursor);
-	return bytesRead;
+	printf("[DEBUG myFSRead] Sucesso: %u bytes lidos, novo cursor: %u\n", totalRead, fdTable[idx].cursor);
+	return totalRead;
 }
 
 // Funcao para a escrita de um arquivo, a partir de um descritor de arquivo
@@ -408,13 +492,112 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 	// Converter descritor de 1-based para 0-based (índice da tabela)
 	int idx = fd - 1;
 
+	printf("[DEBUG myFSWrite] Iniciando escrita: fd=%d, idx=%d, nbytes=%u\n", fd, idx, nbytes);
+
 	// Validar descritor
 	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+		printf("[DEBUG myFSWrite] ERRO: Descritor inválido ou não usado\n");
 		return -1;
 	}
 
-	// TODO: Implementar escrita de arquivo
-	return -1;
+	// Validar buffer
+	if (buf == NULL || nbytes == 0) {
+		printf("[DEBUG myFSWrite] ERRO: Buffer inválido ou nbytes = 0\n");
+		return -1;
+	}
+
+	// Obter informações do descritor
+	Inode *inode = fdTable[idx].inode;
+	Disk *disk = fdTable[idx].disk;
+	if (inode == NULL || disk == NULL) {
+		printf("[DEBUG myFSWrite] ERRO: Inode ou disco não carregado\n");
+		return -1;
+	}
+
+	unsigned int cursor = fdTable[idx].cursor;
+	printf("[DEBUG myFSWrite] Cursor atual: %u\n", cursor);
+
+	// Escrever dados bloco por bloco
+	unsigned int totalWritten = 0;
+	unsigned int blockSize = sb.blockSize; // Tamanho do bloco do superbloco
+
+	while (totalWritten < nbytes) {
+		// Calcular bloco e offset dentro do bloco
+		unsigned int currentPos = cursor + totalWritten;
+		unsigned int blockNum = currentPos / blockSize;
+		unsigned int offsetInBlock = currentPos % blockSize;
+
+		// Obter endereço do bloco (ou alocar se necessário)
+		unsigned int blockAddr = inodeGetBlockAddr(inode, blockNum);
+		if (blockAddr == 0) {
+			// Bloco não alocado - alocar um novo
+			printf("[DEBUG myFSWrite] Bloco %u não alocado, alocando novo bloco...\n", blockNum);
+			blockAddr = allocateFreeBlock(disk);
+			if (blockAddr == 0) {
+				printf("[DEBUG myFSWrite] ERRO: Falha ao alocar bloco livre\n");
+				return -1;
+			}
+
+			// Adicionar bloco ao inode (inodeAddBlock salva automaticamente)
+			if (inodeAddBlock(inode, blockAddr) != 0) {
+				printf("[DEBUG myFSWrite] ERRO: Falha ao adicionar bloco ao inode\n");
+				return -1;
+			}
+
+			printf("[DEBUG myFSWrite] Bloco %u alocado no setor %u\n", blockNum, blockAddr);
+			
+			// Verificar se foi adicionado corretamente
+			unsigned int verifyAddr = inodeGetBlockAddr(inode, blockNum);
+			if (verifyAddr != blockAddr) {
+				printf("[DEBUG myFSWrite] AVISO: Endereço verificado (%u) diferente do alocado (%u)\n", verifyAddr, blockAddr);
+			}
+		}
+
+		// Ler bloco existente (para preservar dados não sobrescritos)
+		unsigned char blockData[blockSize];
+		unsigned int numSectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
+			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+				printf("[DEBUG myFSWrite] ERRO: Falha ao ler setor %u\n", blockAddr + i);
+				return -1;
+			}
+		}
+
+		// Modificar dados no bloco
+		unsigned int bytesToBlock = blockSize - offsetInBlock;
+		if (bytesToBlock > nbytes - totalWritten) {
+			bytesToBlock = nbytes - totalWritten;
+		}
+
+		memcpy(blockData + offsetInBlock, buf + totalWritten, bytesToBlock);
+
+		// Escrever bloco de volta no disco
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
+			if (diskWriteSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+				printf("[DEBUG myFSWrite] ERRO: Falha ao escrever setor %u\n", blockAddr + i);
+				return -1;
+			}
+		}
+
+		totalWritten += bytesToBlock;
+	}
+
+	// Atualizar cursor
+	fdTable[idx].cursor += totalWritten;
+
+	// Atualizar tamanho do arquivo se necessário
+	unsigned int newSize = fdTable[idx].cursor;
+	unsigned int oldSize = inodeGetFileSize(inode);
+	if (newSize > oldSize) {
+		inodeSetFileSize(inode, newSize);
+		// Salvar o inode atualizado no disco
+		if (inodeSave(inode) != 0) {
+			printf("[DEBUG myFSWrite] AVISO: Falha ao salvar inode atualizado\n");
+		}
+	}
+
+	printf("[DEBUG myFSWrite] Sucesso: %u bytes escritos, novo cursor: %u\n", totalWritten, fdTable[idx].cursor);
+	return totalWritten;
 }
 
 // Funcao para fechar um arquivo, a partir de um descritor de arquivo
