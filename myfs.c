@@ -33,12 +33,30 @@ typedef struct
 
 superblock sb;
 
+// Estrutura para descritor de arquivo aberto
+typedef struct {
+	int used;              // 1 = em uso, 0 = livre
+	Disk *disk;            // disco associado
+	unsigned int inodeNum; // numero do inode do arquivo
+	unsigned int cursor;   // posicao atual de leitura/escrita
+	Inode *inode;          // ponteiro para o inode em memoria
+} FileDescriptor;
+
+// Tabela de descritores de arquivo (MAX_FDS = 128, definido em vfs.h)
+static FileDescriptor fdTable[MAX_FDS];
+
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
 // um positivo se ocioso ou, caso contrario, 0.
 int myFSIsIdle(Disk *d)
 {
-	return 0;
+	// Percorre a tabela de descritores procurando algum em uso neste disco
+	for (int i = 0; i < MAX_FDS; i++) {
+		if (fdTable[i].used && fdTable[i].disk == d) {
+			return 0;  // Encontrou arquivo aberto, NAO esta ocioso
+		}
+	}
+	return 1;  // Nenhum arquivo aberto, sistema OCIOSO
 }
 
 // Funcao para formatacao de um disco com o novo sistema de arquivos
