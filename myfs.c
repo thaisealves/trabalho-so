@@ -28,7 +28,7 @@ typedef struct
 	unsigned int inodeTableStart;
 	unsigned int dataBlockStart;
 	unsigned int freeBlockList;
-	Inode* rootInode; // diretorio raiz, inode
+	unsigned int rootInode; // diretorio raiz, numero do inode
 } superblock;
 
 superblock sb;
@@ -47,15 +47,107 @@ int myFSIsIdle(Disk *d)
 // retorna -1.
 int myFSFormat(Disk *d, unsigned int blockSize)
 {
+	// PASSO 1: Validar parametros
+	// printf("\n[DEBUG myFSFormat] Entrada: d=%p, blockSize=%u\n", (void*)d, blockSize);
+
+	if (d == NULL || blockSize == 0 || blockSize % DISK_SECTORDATASIZE != 0) {
+		// printf("[DEBUG myFSFormat] ERRO: Validacao falhou!\n");
+		return -1;  // blockSize deve ser multiplo do tamanho do setor
+	}
+
+	// PASSO 2: Calcular layout do disco
+	unsigned long diskSizeBytes = diskGetSize(d);
+	unsigned long numSectors = diskGetNumSectors(d);
+
+	// printf("[DEBUG myFSFormat] Disco: %lu bytes (%lu setores)\n", diskSizeBytes, numSectors);
+
+	// Numero fixo de i-nodes (opcao A - simples)
+	unsigned int numInodes = 128;
+
+	// Calcular quantos setores os i-nodes ocupam
+	unsigned int inodesPerSector = inodeNumInodesPerSector();
+	unsigned int inodeSectors = (numInodes + inodesPerSector - 1) / inodesPerSector;
+
+	// I-nodes começam no setor 2 (setor 0-1 reservado para superbloco)
+	unsigned int inodeTableStart = 2;
+
+	// Blocos de dados começam após os i-nodes
+	unsigned int sectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
+	unsigned int dataBlockStart = inodeTableStart + inodeSectors;
+
+	// Calcular numero de blocos disponiveis para dados
+	unsigned int dataAreaSectors = numSectors - dataBlockStart;
+	unsigned int numBlocks = dataAreaSectors / sectorsPerBlock;
+
+	// PASSO 3: Preencher superbloco
 	sb.magic = MYFS_MAGIC;
 	sb.blockSize = blockSize;
-	sb.numBlocks = diskGetSize(d);
-	sb.rootInode = 0;
+	sb.numBlocks = numBlocks;
+	sb.numInodes = numInodes;
+	sb.inodeTableStart = inodeTableStart;
+	sb.dataBlockStart = dataBlockStart;
+	sb.freeBlockList = 0;  // pode ser usado depois para bitmap
+	sb.rootInode = 1;      // diretorio raiz sera o i-node 1 (inode 0 nao e valido)
 
-	diskWrite(0, &sb);
-	return sb.numBlocks;
+	// PASSO 4: Escrever superbloco no disco (setor 0)
+	// printf("[DEBUG myFSFormat] Alocando buffer...\n");
+	unsigned char buffer[DISK_SECTORDATASIZE];
 
+	// Converter campos do superbloco para bytes
+	// printf("[DEBUG myFSFormat] Convertendo superbloco para bytes...\n");
+	// printf("[DEBUG myFSFormat] magic=0x%X, blockSize=%u, numBlocks=%u\n",
+	//        sb.magic, sb.blockSize, sb.numBlocks);
 
+	ul2char(sb.magic, &buffer[0]);
+	ul2char(sb.blockSize, &buffer[4]);
+	ul2char(sb.numBlocks, &buffer[8]);
+	ul2char(sb.numInodes, &buffer[12]);
+	ul2char(sb.inodeTableStart, &buffer[16]);
+	ul2char(sb.dataBlockStart, &buffer[20]);
+	ul2char(sb.freeBlockList, &buffer[24]);
+	ul2char(sb.rootInode, &buffer[28]);
+
+	// printf("[DEBUG myFSFormat] Conversao concluida\n");
+
+	// Preencher resto do buffer com zeros
+	for (int i = 32; i < DISK_SECTORDATASIZE; i++) {
+		buffer[i] = 0;
+	}
+
+	if (diskWriteSector(d, 0, buffer) != 0) {
+		return -1;  // falha ao escrever superbloco
+	}
+
+	// PASSO 5: Criar i-node do diretorio raiz
+	// printf("[DEBUG myFSFormat] Criando i-node raiz (numero 1)...\n");
+	Inode *rootInode = inodeCreate(1, d);
+	if (rootInode == NULL) {
+		// printf("[DEBUG myFSFormat] ERRO: inodeCreate retornou NULL\n");
+		return -1;  // falha ao criar i-node raiz
+	}
+	// printf("[DEBUG myFSFormat] I-node raiz criado com sucesso\n");
+
+	// Configurar i-node raiz como diretorio
+	inodeSetFileType(rootInode, FILETYPE_DIR);
+	inodeSetFileSize(rootInode, 0);
+	inodeSetOwner(rootInode, 0);
+	inodeSetGroupOwner(rootInode, 0);
+	inodeSetPermission(rootInode, 0755);
+
+	// Salvar i-node raiz no disco
+	if (inodeSave(rootInode) != 0) {
+		free(rootInode);
+		return -1;  // falha ao salvar i-node raiz
+	}
+
+	free(rootInode);
+
+	// PASSO 6: Inicializar bitmap de blocos livres (TODO: implementar depois)
+	// Por enquanto, assumimos que todos os blocos estao livres
+
+	// PASSO 7: Retornar numero de blocos disponiveis
+	// printf("[DEBUG myFSFormat] Sucesso! Retornando %u blocos\n", numBlocks);
+	return numBlocks;
 }
 
 // Funcao para montagem/desmontagem do sistema de arquivos, se possível.
@@ -152,6 +244,9 @@ int myFSCloseDir(int fd)
 	return -1;
 }
 
+// Variavel estatica para persistir apos installMyFS retornar
+static FSInfo myFSInfo;
+
 // Funcao para instalar seu sistema de arquivos no S.O., registrando-o junto
 // ao virtual FS (vfs). Retorna um identificador unico (slot), caso
 // o sistema de arquivos tenha sido registrado com sucesso.
@@ -159,22 +254,33 @@ int myFSCloseDir(int fd)
 // envio o end. de todas as funcoes implementadas acima pro vfs ter onde buscar
 int installMyFS(void)
 {
-	FSInfo fsInfo = {
-		.fsname = "MyFS",
-		.isidleFn = myFSIsIdle,
-		.formatFn = myFSFormat,
-		.xMountFn = myFSxMount,
-		.openFn = myFSOpen,
-		.readFn = myFSRead,
-		.writeFn = myFSWrite,
-		.closeFn = myFSClose,
-	};
+	// printf("[DEBUG installMyFS] Iniciando instalacao...\n");
 
-	int slot = vfsRegisterFS(&fsInfo);
+	// Preencher struct estatica (persiste apos funcao retornar)
+	myFSInfo.fsid = 0;  // ID do filesystem (importante!)
+	myFSInfo.fsname = "MyFS";
+	myFSInfo.isidleFn = myFSIsIdle;
+	myFSInfo.formatFn = myFSFormat;
+	myFSInfo.xMountFn = myFSxMount;
+	myFSInfo.openFn = myFSOpen;
+	myFSInfo.readFn = myFSRead;
+	myFSInfo.writeFn = myFSWrite;
+	myFSInfo.closeFn = myFSClose;
+	myFSInfo.opendirFn = myFSOpenDir;
+	myFSInfo.readdirFn = myFSReadDir;
+	myFSInfo.linkFn = myFSLink;
+	myFSInfo.unlinkFn = myFSUnlink;
+	myFSInfo.closedirFn = myFSCloseDir;
 
-	if (slot < 0)
-	{
+	// printf("[DEBUG installMyFS] Registrando no VFS (fsid=%d, addr=%p)...\n",
+	//        myFSInfo.fsid, (void*)&myFSInfo);
+	int slot = vfsRegisterFS(&myFSInfo);
+
+	if (slot < 0) {
+		// printf("[DEBUG installMyFS] ERRO: vfsRegisterFS retornou %d\n", slot);
 		return -1;
 	}
+
+	// printf("[DEBUG installMyFS] Sucesso! Slot = %d\n", slot);
 	return slot;
 }
