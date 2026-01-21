@@ -569,15 +569,19 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 			bytesToBlock = nbytes - totalWritten;
 		}
 
+		printf("[DEBUG myFSWrite] Copiando %u bytes para o bloco (offset: %u)\n", bytesToBlock, offsetInBlock);
+		printf("[DEBUG myFSWrite] Primeiros bytes a escrever: '%.10s'\n", buf + totalWritten);
 		memcpy(blockData + offsetInBlock, buf + totalWritten, bytesToBlock);
 
 		// Escrever bloco de volta no disco
+		printf("[DEBUG myFSWrite] Escrevendo bloco no setor %u (%u setores)\n", blockAddr, numSectorsPerBlock);
 		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
 			if (diskWriteSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
 				printf("[DEBUG myFSWrite] ERRO: Falha ao escrever setor %u\n", blockAddr + i);
 				return -1;
 			}
 		}
+		printf("[DEBUG myFSWrite] Bloco escrito com sucesso\n");
 
 		totalWritten += bytesToBlock;
 	}
