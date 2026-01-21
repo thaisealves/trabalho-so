@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "myfs.h"
 #include "vfs.h"
 #include "inode.h"
@@ -132,9 +133,16 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 		buffer[i] = 0;
 	}
 
+	// Depuração: Verificar superbloco antes de gravar
+	printf("[DEBUG myFSFormat] Superbloco: magic=0x%X, blockSize=%u, numBlocks=%u\n",
+		sb.magic, sb.blockSize, sb.numBlocks);
+
 	if (diskWriteSector(d, 0, buffer) != 0) {
+		printf("[DEBUG myFSFormat] ERRO: Falha ao escrever superbloco no setor 0\n");
 		return -1;  // falha ao escrever superbloco
 	}
+
+	printf("[DEBUG myFSFormat] Superbloco gravado com sucesso no setor 0\n");
 
 	// PASSO 5: Criar i-node do diretorio raiz
 	// printf("[DEBUG myFSFormat] Criando i-node raiz (numero 1)...\n");
@@ -175,7 +183,93 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 // montagem ou desmontagem foi bem sucedida ou, caso contrario, 0.
 int myFSxMount(Disk *d, int x)
 {
-	return 0;
+	// PASSO 1: Validar parametros
+	if (d == NULL) {
+		return 0;  // falha: disco invalido
+	}
+
+	// PASSO 2: MONTAGEM (x=1)
+	if (x == 1) {
+		// Ler superbloco do disco (setor 0)
+		unsigned char buffer[DISK_SECTORDATASIZE];
+		if (diskReadSector(d, 0, buffer) != 0) {
+			return 0;  // falha ao ler superbloco
+		}
+
+		// Deserializar campos do superbloco
+		char2ul(&buffer[0], &sb.magic);
+		char2ul(&buffer[4], &sb.blockSize);
+		char2ul(&buffer[8], &sb.numBlocks);
+		char2ul(&buffer[12], &sb.numInodes);
+		char2ul(&buffer[16], &sb.inodeTableStart);
+		char2ul(&buffer[20], &sb.dataBlockStart);
+		char2ul(&buffer[24], &sb.freeBlockList);
+		char2ul(&buffer[28], &sb.rootInode);
+
+		// Depuração: Verificar leitura do superbloco
+		printf("[DEBUG myFSxMount] Superbloco lido: magic=0x%X, blockSize=%u, numBlocks=%u\n",
+			sb.magic, sb.blockSize, sb.numBlocks);
+
+		// Validar magic number
+		if (sb.magic != MYFS_MAGIC) {
+			printf("[DEBUG myFSxMount] ERRO: Magic number inválido (esperado=0x%X, encontrado=0x%X)\n",
+				MYFS_MAGIC, sb.magic);
+			return 0;  // falha: sistema de arquivos nao reconhecido
+		}
+
+		// Validar blockSize (deve ser multiplo de 512)
+		if (sb.blockSize == 0 || sb.blockSize % DISK_SECTORDATASIZE != 0) {
+			printf("[DEBUG myFSxMount] ERRO: blockSize inválido (%u)\n", sb.blockSize);
+			return 0;  // falha: blockSize invalido
+		}
+
+		// Validar outros campos basicos do superbloco
+		if (sb.numBlocks == 0 || sb.numInodes == 0) {
+			return 0;  // falha: superbloco corrompido
+		}
+
+		// Inicializar tabela de descritores de arquivo
+		memset(fdTable, 0, sizeof(fdTable));
+		for (int i = 0; i < MAX_FDS; i++) {
+			fdTable[i].used = 0;
+			fdTable[i].disk = NULL;
+			fdTable[i].inodeNum = 0;
+			fdTable[i].cursor = 0;
+			fdTable[i].inode = NULL;
+		}
+
+		return 1;  // sucesso na montagem
+	}
+
+	// PASSO 3: DESMONTAGEM (x=0)
+	if (x == 0) {
+		// Verificar se o disco esta ocioso (nenhum arquivo aberto)
+		if (!myFSIsIdle(d)) {
+			return 0;  // falha: ainda ha arquivos abertos neste disco
+		}
+
+		// Limpar descritores de arquivo associados a este disco
+		for (int i = 0; i < MAX_FDS; i++) {
+			if (fdTable[i].disk == d) {
+				fdTable[i].used = 0;
+				fdTable[i].disk = NULL;
+				fdTable[i].inodeNum = 0;
+				fdTable[i].cursor = 0;
+				if (fdTable[i].inode != NULL) {
+					free(fdTable[i].inode);
+					fdTable[i].inode = NULL;
+				}
+			}
+		}
+
+		// Limpar superbloco para evitar inconsistencias
+		memset(&sb, 0, sizeof(sb));
+
+		return 1;  // sucesso na desmontagem
+	}
+
+	// PASSO 4: Parametro x invalido
+	return 0;  // falha: valor de x nao reconhecido (deve ser 0 ou 1)
 }
 
 // Funcao para abertura de um arquivo, a partir do caminho especificado
@@ -290,15 +384,18 @@ int installMyFS(void)
 	myFSInfo.unlinkFn = myFSUnlink;
 	myFSInfo.closedirFn = myFSCloseDir;
 
-	// printf("[DEBUG installMyFS] Registrando no VFS (fsid=%d, addr=%p)...\n",
-	//        myFSInfo.fsid, (void*)&myFSInfo);
-	int slot = vfsRegisterFS(&myFSInfo);
+	// Verificar se o fsid é único
+	if (myFSInfo.fsid == 0) {
+		printf("[DEBUG installMyFS] Aviso: fsid está definido como 0. Certifique-se de que não há conflito.\n");
+	}
 
+	// Registrar no VFS
+	int slot = vfsRegisterFS(&myFSInfo);
 	if (slot < 0) {
-		// printf("[DEBUG installMyFS] ERRO: vfsRegisterFS retornou %d\n", slot);
+		printf("[DEBUG installMyFS] ERRO: vfsRegisterFS retornou %d. Registro falhou.\n", slot);
 		return -1;
 	}
 
-	// printf("[DEBUG installMyFS] Sucesso! Slot = %d\n", slot);
+	printf("[DEBUG installMyFS] Sucesso! Slot = %d\n", slot);
 	return slot;
 }
