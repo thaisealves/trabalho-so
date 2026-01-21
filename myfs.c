@@ -19,8 +19,8 @@
 // Declaracoes globais
 // superbloco pro so saber onde estão as coisas
 #define MYFS_MAGIC 0x4D594653
-#define INODE_BEGINSECTOR 2     // Setor a partir do qual i-nodes são gravados
-#define INODE_SIZE 16           // Tamanho do i-node em numero de unsigned ints
+#define INODE_BEGINSECTOR 2 // Setor a partir do qual i-nodes são gravados
+#define INODE_SIZE 16		// Tamanho do i-node em numero de unsigned ints
 
 typedef struct
 {
@@ -36,17 +36,88 @@ typedef struct
 
 superblock sb;
 
+// Bitmaps para gerenciar recursos livres
+static unsigned char *blockBitmap = NULL;  // 1 bit por bloco (1=usado, 0=livre)
+static unsigned char *inodeBitmap = NULL;  // 1 bit por inode (1=usado, 0=livre)
+
 // Estrutura para descritor de arquivo aberto
-typedef struct {
-	int used;              // 1 = em uso, 0 = livre
-	Disk *disk;            // disco associado
+typedef struct
+{
+	int used;			   // 1 = em uso, 0 = livre
+	Disk *disk;			   // disco associado
 	unsigned int inodeNum; // numero do inode do arquivo
 	unsigned int cursor;   // posicao atual de leitura/escrita
-	Inode *inode;          // ponteiro para o inode em memoria
+	Inode *inode;		   // ponteiro para o inode em memoria
 } FileDescriptor;
 
 // Tabela de descritores de arquivo (MAX_FDS = 128, definido em vfs.h)
 static FileDescriptor fdTable[MAX_FDS];
+
+// path -> inode para impedir que arquivos diferentes usem o mesmo inode
+#define MAX_FILE_ENTRIES 128
+typedef struct
+{
+	char path[MAX_FILENAME_LENGTH + 1];
+	unsigned int inodeNum;
+} FileEntry;
+
+static FileEntry fileTable[MAX_FILE_ENTRIES];
+
+static int findFileEntry(const char *path)
+{
+	for (int i = 0; i < MAX_FILE_ENTRIES; i++)
+	{
+		if (fileTable[i].inodeNum != 0 && strcmp(fileTable[i].path, path) == 0)
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int addFileEntry(const char *path, unsigned int inodeNum)
+{
+	for (int i = 0; i < MAX_FILE_ENTRIES; i++)
+	{
+		if (fileTable[i].inodeNum == 0)
+		{
+			fileTable[i].inodeNum = inodeNum;
+			strncpy(fileTable[i].path, path, MAX_FILENAME_LENGTH);
+			fileTable[i].path[MAX_FILENAME_LENGTH] = '\0';
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Funcoes auxiliares para manipulacao de bitmap
+static void setBit(unsigned char *bitmap, unsigned int index)
+{
+	bitmap[index / 8] |= (1 << (index % 8));
+}
+
+static void clearBit(unsigned char *bitmap, unsigned int index)
+{
+	bitmap[index / 8] &= ~(1 << (index % 8));
+}
+
+static int getBit(unsigned char *bitmap, unsigned int index)
+{
+	return (bitmap[index / 8] >> (index % 8)) & 1;
+}
+
+// Encontra primeiro bit livre (0) no bitmap, retorna indice ou -1 se nenhum livre
+static int findFreeBit(unsigned char *bitmap, unsigned int maxBits)
+{
+	for (unsigned int i = 0; i < maxBits; i++)
+	{
+		if (!getBit(bitmap, i))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
 
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
@@ -54,67 +125,62 @@ static FileDescriptor fdTable[MAX_FDS];
 int myFSIsIdle(Disk *d)
 {
 	// Percorre a tabela de descritores procurando algum em uso neste disco
-	for (int i = 0; i < MAX_FDS; i++) {
-		if (fdTable[i].used && fdTable[i].disk == d) {
+	for (int i = 0; i < MAX_FDS; i++)
+	{
+		if (fdTable[i].used && fdTable[i].disk == d)
+		{
 			printf("[DEBUG myFSIsIdle] Descritor %d ainda em uso no disco %p\n", i, (void *)d);
-			return 0;  // Encontrou arquivo aberto, NAO esta ocioso
+			return 0; // Encontrou arquivo aberto, NAO esta ocioso
 		}
 	}
 	printf("[DEBUG myFSIsIdle] Sistema de arquivos está ocioso\n");
-	return 1;  // Nenhum arquivo aberto, sistema OCIOSO
+	return 1; // Nenhum arquivo aberto, sistema OCIOSO
 }
 
-// Funcao auxiliar para alocar um bloco livre no disco
+// Funcao auxiliar para alocar um bloco livre no disco usando bitmap
 // Retorna o setor inicial do bloco alocado, ou 0 se nenhum bloco livre
 static unsigned int allocateFreeBlock(Disk *d)
 {
-	if (d == NULL || sb.magic != MYFS_MAGIC) {
-		printf("[DEBUG allocateFreeBlock] ERRO: Disco ou superbloco inválido\n");
+	if (d == NULL || sb.magic != MYFS_MAGIC || blockBitmap == NULL)
+	{
+		printf("[DEBUG allocateFreeBlock] ERRO: Disco, superbloco ou bitmap inválido\n");
 		return 0;
 	}
 
 	unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
-	unsigned int totalBlocks = sb.numBlocks;
 	unsigned int dataBlockStart = sb.dataBlockStart;
 
-	printf("[DEBUG allocateFreeBlock] Procurando bloco livre (total: %u blocos)\n", totalBlocks);
-
-	// Criar um array para rastrear blocos usados
-	// Verificar todos os inodes e marcar blocos alocados
-	unsigned char usedBlocks[totalBlocks];
-	memset(usedBlocks, 0, sizeof(usedBlocks));
-
-	// Percorrer todos os inodes possíveis e marcar seus blocos como usados
-	for (unsigned int inodeNum = 1; inodeNum <= sb.numInodes; inodeNum++) {
-		Inode *checkInode = inodeLoad(inodeNum, d);
-		if (checkInode != NULL) {
-			// Marcar blocos deste inode como usados
-			unsigned int numBlocksInInode = inodeNumBlockAddresses();
-			for (unsigned int i = 0; i < numBlocksInInode; i++) {
-				unsigned int blockAddr = inodeGetBlockAddr(checkInode, i);
-				if (blockAddr > 0) {
-					// Calcular número do bloco a partir do setor
-					unsigned int blockNum = (blockAddr - dataBlockStart) / sectorsPerBlock;
-					if (blockNum < totalBlocks) {
-						usedBlocks[blockNum] = 1;
-					}
-				}
-			}
-			free(checkInode);
-		}
+	// Buscar primeiro bloco livre no bitmap (O(n) mas em memória, sem I/O)
+	int freeBlockNum = findFreeBit(blockBitmap, sb.numBlocks);
+	if (freeBlockNum < 0)
+	{
+		printf("[DEBUG allocateFreeBlock] ERRO: Nenhum bloco livre encontrado\n");
+		return 0;
 	}
 
-	// Encontrar primeiro bloco não usado
-	for (unsigned int blockNum = 0; blockNum < totalBlocks; blockNum++) {
-		if (usedBlocks[blockNum] == 0) {
-			unsigned int blockSector = dataBlockStart + (blockNum * sectorsPerBlock);
-			printf("[DEBUG allocateFreeBlock] Alocando bloco %u no setor %u\n", blockNum, blockSector);
-			return blockSector;
-		}
-	}
+	// Marcar bloco como usado no bitmap
+	setBit(blockBitmap, freeBlockNum);
 
-	printf("[DEBUG allocateFreeBlock] ERRO: Nenhum bloco livre encontrado\n");
-	return 0; // Nenhum bloco livre
+	unsigned int blockSector = dataBlockStart + (freeBlockNum * sectorsPerBlock);
+	printf("[DEBUG allocateFreeBlock] Alocando bloco %u no setor %u\n", freeBlockNum, blockSector);
+	return blockSector;
+}
+
+// Funcao para liberar um bloco no bitmap
+static void freeBlock(unsigned int blockSector)
+{
+	if (blockBitmap == NULL || sb.magic != MYFS_MAGIC)
+		return;
+
+	unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
+	unsigned int dataBlockStart = sb.dataBlockStart;
+	unsigned int blockNum = (blockSector - dataBlockStart) / sectorsPerBlock;
+
+	if (blockNum < sb.numBlocks)
+	{
+		clearBit(blockBitmap, blockNum);
+		printf("[DEBUG freeBlock] Bloco %u liberado\n", blockNum);
+	}
 }
 
 // Funcao para formatacao de um disco com o novo sistema de arquivos
@@ -126,9 +192,10 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	// PASSO 1: Validar parametros
 	// printf("\n[DEBUG myFSFormat] Entrada: d=%p, blockSize=%u\n", (void*)d, blockSize);
 
-	if (d == NULL || blockSize == 0 || blockSize % DISK_SECTORDATASIZE != 0) {
+	if (d == NULL || blockSize == 0 || blockSize % DISK_SECTORDATASIZE != 0)
+	{
 		// printf("[DEBUG myFSFormat] ERRO: Validacao falhou!\n");
-		return -1;  // blockSize deve ser multiplo do tamanho do setor
+		return -1; // blockSize deve ser multiplo do tamanho do setor
 	}
 
 	// PASSO 2: Calcular layout do disco
@@ -162,8 +229,8 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	sb.numInodes = numInodes;
 	sb.inodeTableStart = inodeTableStart;
 	sb.dataBlockStart = dataBlockStart;
-	sb.freeBlockList = 0;  // pode ser usado depois para bitmap
-	sb.rootInode = 1;      // diretorio raiz sera o i-node 1 (inode 0 nao e valido)
+	sb.freeBlockList = 0; // pode ser usado depois para bitmap
+	sb.rootInode = 1;	  // diretorio raiz sera o i-node 1 (inode 0 nao e valido)
 
 	// PASSO 4: Escrever superbloco no disco (setor 0)
 	// printf("[DEBUG myFSFormat] Alocando buffer...\n");
@@ -186,29 +253,96 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	// printf("[DEBUG myFSFormat] Conversao concluida\n");
 
 	// Preencher resto do buffer com zeros
-	for (int i = 32; i < DISK_SECTORDATASIZE; i++) {
+	for (int i = 32; i < DISK_SECTORDATASIZE; i++)
+	{
 		buffer[i] = 0;
 	}
 
 	// Depuração: Verificar superbloco antes de gravar
 	printf("[DEBUG myFSFormat] Superbloco: magic=0x%X, blockSize=%u, numBlocks=%u\n",
-		sb.magic, sb.blockSize, sb.numBlocks);
+		   sb.magic, sb.blockSize, sb.numBlocks);
 
-	if (diskWriteSector(d, 0, buffer) != 0) {
+	if (diskWriteSector(d, 0, buffer) != 0)
+	{
 		printf("[DEBUG myFSFormat] ERRO: Falha ao escrever superbloco no setor 0\n");
-		return -1;  // falha ao escrever superbloco
+		return -1; // falha ao escrever superbloco
 	}
 
 	printf("[DEBUG myFSFormat] Superbloco gravado com sucesso no setor 0\n");
 
-	// PASSO 5: Criar i-node do diretorio raiz
-	// printf("[DEBUG myFSFormat] Criando i-node raiz (numero 1)...\n");
-	Inode *rootInode = inodeCreate(1, d);
-	if (rootInode == NULL) {
-		// printf("[DEBUG myFSFormat] ERRO: inodeCreate retornou NULL\n");
-		return -1;  // falha ao criar i-node raiz
+	// inicializar tabela de inodes com zeros
+	unsigned char zeroBuffer[DISK_SECTORDATASIZE];
+	memset(zeroBuffer, 0, DISK_SECTORDATASIZE);
+
+	for (unsigned int i = 0; i < inodeSectors; i++)
+	{
+		if (diskWriteSector(d, inodeTableStart + i, zeroBuffer) != 0)
+		{
+			printf("[DEBUG myFSFormat] ERRO ao zerar setor de inode %u\n",
+				   inodeTableStart + i);
+			return -1;
+		}
 	}
-	// printf("[DEBUG myFSFormat] I-node raiz criado com sucesso\n");
+
+	printf("[DEBUG myFSFormat] Tabela de inodes inicializada (%u setores)\n",
+		   inodeSectors);
+
+	// PASSO 5: Inicializar bitmaps em memória
+	unsigned int bitmapBlockBytes = (numBlocks + 7) / 8;  // Arredondar para cima
+	unsigned int bitmapInodeBytes = (numInodes + 7) / 8;
+
+	if (blockBitmap)
+		free(blockBitmap);
+	if (inodeBitmap)
+		free(inodeBitmap);
+
+	blockBitmap = (unsigned char *)calloc(bitmapBlockBytes, 1);
+	inodeBitmap = (unsigned char *)calloc(bitmapInodeBytes, 1);
+
+	if (blockBitmap == NULL || inodeBitmap == NULL)
+	{
+		printf("[DEBUG myFSFormat] ERRO: Falha ao alocar bitmaps\n");
+		return -1;
+	}
+
+	printf("[DEBUG myFSFormat] Bitmaps inicializados (%u bytes blocos, %u bytes inodes)\n",
+		   bitmapBlockBytes, bitmapInodeBytes);
+
+	// PASSO 6: Inicializar todos os i-nodes vazios com seus numeros gravados
+	for (unsigned int inodeNum = 1; inodeNum <= numInodes; inodeNum++)
+	{
+		Inode *tmp = inodeCreate(inodeNum, d);
+		if (tmp == NULL)
+		{
+			printf("[DEBUG myFSFormat] ERRO: Falha ao criar inode %u\n", inodeNum);
+			return -1;
+		}
+		free(tmp);
+	}
+
+	// PASSO 7: Criar i-node do diretorio raiz
+	Inode *rootInode = inodeLoad(1, d);
+	if (rootInode == NULL)
+	{
+		return -1;
+	}
+
+	// Marcar inode 1 como usado no bitmap
+	setBit(inodeBitmap, 1);
+
+	unsigned int rootBlock = allocateFreeBlock(d);
+	if (rootBlock == 0)
+	{
+		free(rootInode);
+		return -1;
+	}
+
+	if (inodeAddBlock(rootInode, rootBlock) != 0)
+	{
+		printf("[DEBUG myFSFormat] ERRO: Falha ao adicionar bloco ao inode raiz\n");
+		free(rootInode);
+		return -1;
+	}
 
 	// Configurar i-node raiz como diretorio
 	inodeSetFileType(rootInode, FILETYPE_DIR);
@@ -218,9 +352,10 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	inodeSetPermission(rootInode, 0755);
 
 	// Salvar i-node raiz no disco
-	if (inodeSave(rootInode) != 0) {
+	if (inodeSave(rootInode) != 0)
+	{
 		free(rootInode);
-		return -1;  // falha ao salvar i-node raiz
+		return -1; // falha ao salvar i-node raiz
 	}
 
 	free(rootInode);
@@ -241,16 +376,19 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 int myFSxMount(Disk *d, int x)
 {
 	// PASSO 1: Validar parametros
-	if (d == NULL) {
-		return 0;  // falha: disco invalido
+	if (d == NULL)
+	{
+		return 0; // falha: disco invalido
 	}
 
 	// PASSO 2: MONTAGEM (x=1)
-	if (x == 1) {
+	if (x == 1)
+	{
 		// Ler superbloco do disco (setor 0)
 		unsigned char buffer[DISK_SECTORDATASIZE];
-		if (diskReadSector(d, 0, buffer) != 0) {
-			return 0;  // falha ao ler superbloco
+		if (diskReadSector(d, 0, buffer) != 0)
+		{
+			return 0; // falha ao ler superbloco
 		}
 
 		// Deserializar campos do superbloco
@@ -265,29 +403,33 @@ int myFSxMount(Disk *d, int x)
 
 		// Depuração: Verificar leitura do superbloco
 		printf("[DEBUG myFSxMount] Superbloco lido: magic=0x%X, blockSize=%u, numBlocks=%u\n",
-			sb.magic, sb.blockSize, sb.numBlocks);
+			   sb.magic, sb.blockSize, sb.numBlocks);
 
 		// Validar magic number
-		if (sb.magic != MYFS_MAGIC) {
+		if (sb.magic != MYFS_MAGIC)
+		{
 			printf("[DEBUG myFSxMount] ERRO: Magic number inválido (esperado=0x%X, encontrado=0x%X)\n",
-				MYFS_MAGIC, sb.magic);
-			return 0;  // falha: sistema de arquivos nao reconhecido
+				   MYFS_MAGIC, sb.magic);
+			return 0; // falha: sistema de arquivos nao reconhecido
 		}
 
 		// Validar blockSize (deve ser multiplo de 512)
-		if (sb.blockSize == 0 || sb.blockSize % DISK_SECTORDATASIZE != 0) {
+		if (sb.blockSize == 0 || sb.blockSize % DISK_SECTORDATASIZE != 0)
+		{
 			printf("[DEBUG myFSxMount] ERRO: blockSize inválido (%u)\n", sb.blockSize);
-			return 0;  // falha: blockSize invalido
+			return 0; // falha: blockSize invalido
 		}
 
 		// Validar outros campos basicos do superbloco
-		if (sb.numBlocks == 0 || sb.numInodes == 0) {
-			return 0;  // falha: superbloco corrompido
+		if (sb.numBlocks == 0 || sb.numInodes == 0)
+		{
+			return 0; // falha: superbloco corrompido
 		}
 
 		// Inicializar tabela de descritores de arquivo
 		memset(fdTable, 0, sizeof(fdTable));
-		for (int i = 0; i < MAX_FDS; i++) {
+		for (int i = 0; i < MAX_FDS; i++)
+		{
 			fdTable[i].used = 0;
 			fdTable[i].disk = NULL;
 			fdTable[i].inodeNum = 0;
@@ -295,38 +437,113 @@ int myFSxMount(Disk *d, int x)
 			fdTable[i].inode = NULL;
 		}
 
-		return 1;  // sucesso na montagem
+		// Limpar tabela de caminhos para que cada execucao comece sem lixo
+		memset(fileTable, 0, sizeof(fileTable));
+
+		// Alocar e reconstruir bitmaps a partir do disco
+		unsigned int bitmapBlockBytes = (sb.numBlocks + 7) / 8;
+		unsigned int bitmapInodeBytes = (sb.numInodes + 7) / 8;
+
+		if (blockBitmap)
+			free(blockBitmap);
+		if (inodeBitmap)
+			free(inodeBitmap);
+
+		blockBitmap = (unsigned char *)calloc(bitmapBlockBytes, 1);
+		inodeBitmap = (unsigned char *)calloc(bitmapInodeBytes, 1);
+
+		if (blockBitmap == NULL || inodeBitmap == NULL)
+		{
+			printf("[DEBUG myFSxMount] ERRO: Falha ao alocar bitmaps\n");
+			return 0;
+		}
+
+		// Reconstruir bitmaps escaneando inodes (feito apenas uma vez na montagem)
+		unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
+		unsigned int dataBlockStart = sb.dataBlockStart;
+
+		for (unsigned int inodeNum = 1; inodeNum <= sb.numInodes; inodeNum++)
+		{
+			Inode *checkInode = inodeLoad(inodeNum, d);
+			if (checkInode != NULL)
+			{
+				// Verificar se inode está em uso (tem pelo menos um bloco alocado)
+				unsigned int firstBlock = inodeGetBlockAddr(checkInode, 0);
+				if (firstBlock > 0)
+				{
+					// Marcar inode como usado
+					setBit(inodeBitmap, inodeNum);
+
+					// Marcar todos os blocos deste inode como usados
+					unsigned int numBlocksInInode = inodeNumBlockAddresses();
+					for (unsigned int i = 0; i < numBlocksInInode; i++)
+					{
+						unsigned int blockAddr = inodeGetBlockAddr(checkInode, i);
+						if (blockAddr > 0)
+						{
+							unsigned int blockNum = (blockAddr - dataBlockStart) / sectorsPerBlock;
+							if (blockNum < sb.numBlocks)
+							{
+								setBit(blockBitmap, blockNum);
+							}
+						}
+					}
+				}
+				free(checkInode);
+			}
+		}
+
+		printf("[DEBUG myFSxMount] Bitmaps reconstruídos com sucesso\n");
+
+		return 1; // sucesso na montagem
 	}
 
 	// PASSO 3: DESMONTAGEM (x=0)
-	if (x == 0) {
+	if (x == 0)
+	{
 		// Verificar se o disco esta ocioso (nenhum arquivo aberto)
-		if (!myFSIsIdle(d)) {
-			return 0;  // falha: ainda ha arquivos abertos neste disco
+		if (!myFSIsIdle(d))
+		{
+			return 0; // falha: ainda ha arquivos abertos neste disco
 		}
 
 		// Limpar descritores de arquivo associados a este disco
-		for (int i = 0; i < MAX_FDS; i++) {
-			if (fdTable[i].disk == d) {
+		for (int i = 0; i < MAX_FDS; i++)
+		{
+			if (fdTable[i].disk == d)
+			{
 				fdTable[i].used = 0;
 				fdTable[i].disk = NULL;
 				fdTable[i].inodeNum = 0;
 				fdTable[i].cursor = 0;
-				if (fdTable[i].inode != NULL) {
+				if (fdTable[i].inode != NULL)
+				{
 					free(fdTable[i].inode);
 					fdTable[i].inode = NULL;
 				}
 			}
 		}
 
+		// Liberar bitmaps
+		if (blockBitmap)
+		{
+			free(blockBitmap);
+			blockBitmap = NULL;
+		}
+		if (inodeBitmap)
+		{
+			free(inodeBitmap);
+			inodeBitmap = NULL;
+		}
+
 		// Limpar superbloco para evitar inconsistencias
 		memset(&sb, 0, sizeof(sb));
 
-		return 1;  // sucesso na desmontagem
+		return 1; // sucesso na desmontagem
 	}
 
 	// PASSO 4: Parametro x invalido
-	return 0;  // falha: valor de x nao reconhecido (deve ser 0 ou 1)
+	return 0; // falha: valor de x nao reconhecido (deve ser 0 ou 1)
 }
 
 // Funcao para abertura de um arquivo, a partir do caminho especificado
@@ -335,53 +552,121 @@ int myFSxMount(Disk *d, int x)
 // em caso de sucesso. Retorna -1, caso contrario.
 int myFSOpen(Disk *d, const char *path)
 {
-    // Validar parametros
-    if (d == NULL || path == NULL || strlen(path) == 0) {
-        printf("[DEBUG myFSOpen] ERRO: Parâmetros inválidos\n");
-        return -1;
-    }
+	// Validar parametros
+	if (d == NULL || path == NULL || strlen(path) == 0)
+	{
+		printf("[DEBUG myFSOpen] ERRO: Parâmetros inválidos\n");
+		return -1;
+	}
 
-    // Procurar um descritor livre na tabela
-    int fd = -1;
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!fdTable[i].used) {
-            fd = i;
-            break;
-        }
-    }
+	if (strlen(path) > MAX_FILENAME_LENGTH)
+	{
+		printf("[DEBUG myFSOpen] ERRO: Caminho muito longo (%zu)\n", strlen(path));
+		return -1;
+	}
 
-    if (fd == -1) {
-        printf("[DEBUG myFSOpen] ERRO: Tabela de descritores cheia\n");
-        return -1; // Sem espaço na tabela de descritores
-    }
+	// Procurar um descritor livre na tabela
+	int fd = -1;
+	for (int i = 0; i < MAX_FDS; i++)
+	{
+		if (!fdTable[i].used)
+		{
+			fd = i;
+			break;
+		}
+	}
 
-    // Criar ou localizar o inode do arquivo
-    printf("[DEBUG myFSOpen] Tentando carregar inode para o arquivo '%s'\n", path);
-    unsigned long inodeSectorAddr = INODE_BEGINSECTOR + (1 - 1) * INODE_SIZE * sizeof(unsigned int) / DISK_SECTORDATASIZE;
-    printf("[DEBUG myFSOpen] Calculado endereço do setor do inode: %lu\n", inodeSectorAddr);
+	if (fd == -1)
+	{
+		printf("[DEBUG myFSOpen] ERRO: Tabela de descritores cheia\n");
+		return -1; // Sem espaço na tabela de descritores
+	}
 
-    Inode *inode = inodeLoad(1, d); // Exemplo: carregar inode 1 (ajustar lógica conforme necessário)
-    if (inode == NULL) {
-        printf("[DEBUG myFSOpen] Inode não encontrado. Tentando criar um novo inode para '%s'\n", path);
-        inode = inodeCreate(1, d); // Criar inode se não existir
-        if (inode == NULL) {
-            printf("[DEBUG myFSOpen] ERRO: Falha ao criar inode para '%s'\n", path);
-            return -1;
-        }
-        printf("[DEBUG myFSOpen] Sucesso: Inode criado para '%s'\n", path);
-    } else {
-        printf("[DEBUG myFSOpen] Sucesso: Inode carregado para '%s'\n", path);
-    }
+	unsigned int inodeNum = 0;
+	Inode *inode = NULL;
 
-    // Preencher o descritor de arquivo
-    fdTable[fd].used = 1;
-    fdTable[fd].disk = d;
-    fdTable[fd].inodeNum = 1; // Exemplo: associar ao inode 1 (ajustar conforme necessário)
-    fdTable[fd].cursor = 0;
-    fdTable[fd].inode = inode;
+	// Verificar se já existe mapeamento path->inode
+	int entryIdx = findFileEntry(path);
+	if (entryIdx >= 0)
+	{
+		inodeNum = fileTable[entryIdx].inodeNum;
+		printf("[DEBUG myFSOpen] Mapeamento encontrado para '%s' -> inode %u\n", path, inodeNum);
+		inode = inodeLoad(inodeNum, d);
+		if (inode == NULL)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Falha ao carregar inode %u para '%s'\n", inodeNum, path);
+			return -1;
+		}
+	}
+	else
+	{
+		// Alocar um novo inode livre usando bitmap (pular inode 0 e 1)
+		int freeInode = -1;
+		for (unsigned int i = 2; i <= sb.numInodes; i++)
+		{
+			if (!getBit(inodeBitmap, i))
+			{
+				freeInode = i;
+				break;
+			}
+		}
 
-    printf("[DEBUG myFSOpen] Sucesso: Arquivo aberto com descritor %d (retornando %d)\n", fd, fd + 1);
-    return fd + 1; // Retornar fd+1 pois o sistema espera descritores > 0
+		if (freeInode < 0)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Nenhum inode livre disponível para '%s'\n", path);
+			return -1;
+		}
+
+		inodeNum = freeInode;
+		printf("[DEBUG myFSOpen] Inode livre %u encontrado no bitmap\n", inodeNum);
+
+		inode = inodeCreate(inodeNum, d);
+		if (inode == NULL)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Falha ao criar inode %u para '%s'\n", inodeNum, path);
+			return -1;
+		}
+
+		inodeSetFileType(inode, FILETYPE_REGULAR);
+		inodeSetFileSize(inode, 0);
+		inodeSetOwner(inode, 0);
+		inodeSetGroupOwner(inode, 0);
+		inodeSetPermission(inode, 0644);
+		unsigned int firstBlock = allocateFreeBlock(d);
+		if (firstBlock == 0)
+		{
+			free(inode);
+			return -1;
+		}
+
+		inodeAddBlock(inode, firstBlock);
+		if (inodeSave(inode) != 0)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Falha ao salvar inode %u para '%s'\n", inodeNum, path);
+			free(inode);
+			return -1;
+		}
+
+		if (addFileEntry(path, inodeNum) < 0)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Tabela de caminhos cheia ao registrar '%s'\n", path);
+			free(inode);
+			return -1;
+		}
+		// Marcar inode como usado no bitmap
+		setBit(inodeBitmap, inodeNum);
+		printf("[DEBUG myFSOpen] Novo inode %u criado para '%s'\n", inodeNum, path);
+	}
+
+	// Preencher o descritor de arquivo
+	fdTable[fd].used = 1;
+	fdTable[fd].disk = d;
+	fdTable[fd].inodeNum = inodeNum;
+	fdTable[fd].cursor = 0;
+	fdTable[fd].inode = inode;
+
+	printf("[DEBUG myFSOpen] Sucesso: Arquivo aberto com descritor %d (retornando %d)\n", fd, fd + 1);
+	return fd + 1; // Retornar fd+1 pois o sistema espera descritores > 0
 }
 
 // Funcao para a leitura de um arquivo, a partir de um descritor de arquivo
@@ -398,13 +683,15 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	printf("[DEBUG myFSRead] Iniciando leitura: fd=%d, idx=%d, nbytes=%u\n", fd, idx, nbytes);
 
 	// Validar descritor
-	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used)
+	{
 		printf("[DEBUG myFSRead] ERRO: Descritor inválido ou não usado\n");
 		return -1;
 	}
 
 	// Validar buffer
-	if (buf == NULL || nbytes == 0) {
+	if (buf == NULL || nbytes == 0)
+	{
 		printf("[DEBUG myFSRead] ERRO: Buffer inválido ou nbytes = 0\n");
 		return -1;
 	}
@@ -412,7 +699,8 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	// Obter informações do descritor
 	Inode *inode = fdTable[idx].inode;
 	Disk *disk = fdTable[idx].disk;
-	if (inode == NULL || disk == NULL) {
+	if (inode == NULL || disk == NULL)
+	{
 		printf("[DEBUG myFSRead] ERRO: Inode ou disco não carregado\n");
 		return -1;
 	}
@@ -424,14 +712,16 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	printf("[DEBUG myFSRead] Tamanho do arquivo: %u bytes, cursor atual: %u\n", fileSize, cursor);
 
 	// Verificar se já chegamos ao fim do arquivo
-	if (cursor >= fileSize) {
+	if (cursor >= fileSize)
+	{
 		printf("[DEBUG myFSRead] Fim do arquivo atingido\n");
 		return 0; // EOF
 	}
 
 	// Calcular quantos bytes podemos ler
 	unsigned int bytesToRead = nbytes;
-	if (cursor + bytesToRead > fileSize) {
+	if (cursor + bytesToRead > fileSize)
+	{
 		bytesToRead = fileSize - cursor;
 	}
 
@@ -441,7 +731,8 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	unsigned int totalRead = 0;
 	unsigned int blockSize = sb.blockSize; // Tamanho do bloco do superbloco
 
-	while (totalRead < bytesToRead) {
+	while (totalRead < bytesToRead)
+	{
 		// Calcular bloco e offset dentro do bloco
 		unsigned int currentPos = cursor + totalRead;
 		unsigned int blockNum = currentPos / blockSize;
@@ -449,7 +740,8 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 
 		// Obter endereço do bloco
 		unsigned int blockAddr = inodeGetBlockAddr(inode, blockNum);
-		if (blockAddr == 0) {
+		if (blockAddr == 0)
+		{
 			printf("[DEBUG myFSRead] AVISO: Bloco %u não alocado\n", blockNum);
 			break; // Bloco não alocado
 		}
@@ -457,8 +749,10 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 		// Ler bloco do disco
 		unsigned char blockData[blockSize];
 		unsigned int numSectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
-		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
-			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++)
+		{
+			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0)
+			{
 				printf("[DEBUG myFSRead] ERRO: Falha ao ler setor %u\n", blockAddr + i);
 				return -1;
 			}
@@ -466,7 +760,8 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 
 		// Copiar dados do bloco para o buffer
 		unsigned int bytesFromBlock = blockSize - offsetInBlock;
-		if (bytesFromBlock > bytesToRead - totalRead) {
+		if (bytesFromBlock > bytesToRead - totalRead)
+		{
 			bytesFromBlock = bytesToRead - totalRead;
 		}
 
@@ -495,13 +790,15 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 	printf("[DEBUG myFSWrite] Iniciando escrita: fd=%d, idx=%d, nbytes=%u\n", fd, idx, nbytes);
 
 	// Validar descritor
-	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used)
+	{
 		printf("[DEBUG myFSWrite] ERRO: Descritor inválido ou não usado\n");
 		return -1;
 	}
 
 	// Validar buffer
-	if (buf == NULL || nbytes == 0) {
+	if (buf == NULL || nbytes == 0)
+	{
 		printf("[DEBUG myFSWrite] ERRO: Buffer inválido ou nbytes = 0\n");
 		return -1;
 	}
@@ -509,7 +806,8 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 	// Obter informações do descritor
 	Inode *inode = fdTable[idx].inode;
 	Disk *disk = fdTable[idx].disk;
-	if (inode == NULL || disk == NULL) {
+	if (inode == NULL || disk == NULL)
+	{
 		printf("[DEBUG myFSWrite] ERRO: Inode ou disco não carregado\n");
 		return -1;
 	}
@@ -521,7 +819,8 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 	unsigned int totalWritten = 0;
 	unsigned int blockSize = sb.blockSize; // Tamanho do bloco do superbloco
 
-	while (totalWritten < nbytes) {
+	while (totalWritten < nbytes)
+	{
 		// Calcular bloco e offset dentro do bloco
 		unsigned int currentPos = cursor + totalWritten;
 		unsigned int blockNum = currentPos / blockSize;
@@ -529,35 +828,40 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 
 		// Obter endereço do bloco (ou alocar se necessário)
 		unsigned int blockAddr = inodeGetBlockAddr(inode, blockNum);
-		if (blockAddr == 0) {
+		if (blockAddr == 0)
+		{
 			// Bloco não alocado - alocar um novo
 			printf("[DEBUG myFSWrite] Bloco %u não alocado, alocando novo bloco...\n", blockNum);
 			blockAddr = allocateFreeBlock(disk);
-			if (blockAddr == 0) {
+			if (blockAddr == 0)
+			{
 				printf("[DEBUG myFSWrite] ERRO: Falha ao alocar bloco livre\n");
 				return -1;
 			}
 
 			// Adicionar bloco ao inode (inodeAddBlock salva automaticamente)
-			if (inodeAddBlock(inode, blockAddr) != 0) {
+			if (inodeAddBlock(inode, blockAddr) != 0)
+			{
 				printf("[DEBUG myFSWrite] ERRO: Falha ao adicionar bloco ao inode\n");
 				return -1;
 			}
 
 			printf("[DEBUG myFSWrite] Bloco %u alocado no setor %u\n", blockNum, blockAddr);
-			
+
 			// Verificar se foi adicionado corretamente
 			unsigned int verifyAddr = inodeGetBlockAddr(inode, blockNum);
-			if (verifyAddr != blockAddr) {
+			if (verifyAddr != blockAddr)
+			{
 				printf("[DEBUG myFSWrite] AVISO: Endereço verificado (%u) diferente do alocado (%u)\n", verifyAddr, blockAddr);
 			}
 		}
-
 		// Ler bloco existente (para preservar dados não sobrescritos)
 		unsigned char blockData[blockSize];
 		unsigned int numSectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
-		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
-			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++)
+		{
+			if (diskReadSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0)
+			{
 				printf("[DEBUG myFSWrite] ERRO: Falha ao ler setor %u\n", blockAddr + i);
 				return -1;
 			}
@@ -565,7 +869,8 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 
 		// Modificar dados no bloco
 		unsigned int bytesToBlock = blockSize - offsetInBlock;
-		if (bytesToBlock > nbytes - totalWritten) {
+		if (bytesToBlock > nbytes - totalWritten)
+		{
 			bytesToBlock = nbytes - totalWritten;
 		}
 
@@ -575,8 +880,10 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 
 		// Escrever bloco de volta no disco
 		printf("[DEBUG myFSWrite] Escrevendo bloco no setor %u (%u setores)\n", blockAddr, numSectorsPerBlock);
-		for (unsigned int i = 0; i < numSectorsPerBlock; i++) {
-			if (diskWriteSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0) {
+		for (unsigned int i = 0; i < numSectorsPerBlock; i++)
+		{
+			if (diskWriteSector(disk, blockAddr + i, blockData + i * DISK_SECTORDATASIZE) != 0)
+			{
 				printf("[DEBUG myFSWrite] ERRO: Falha ao escrever setor %u\n", blockAddr + i);
 				return -1;
 			}
@@ -592,10 +899,12 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 	// Atualizar tamanho do arquivo se necessário
 	unsigned int newSize = fdTable[idx].cursor;
 	unsigned int oldSize = inodeGetFileSize(inode);
-	if (newSize > oldSize) {
+	if (newSize > oldSize)
+	{
 		inodeSetFileSize(inode, newSize);
 		// Salvar o inode atualizado no disco
-		if (inodeSave(inode) != 0) {
+		if (inodeSave(inode) != 0)
+		{
 			printf("[DEBUG myFSWrite] AVISO: Falha ao salvar inode atualizado\n");
 		}
 	}
@@ -608,34 +917,37 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
-    // Converter descritor de 1-based para 0-based (índice da tabela)
-    int idx = fd - 1;
+	// Converter descritor de 1-based para 0-based (índice da tabela)
+	int idx = fd - 1;
 
-    // Validar descritor de arquivo
-    if (idx < 0 || idx >= MAX_FDS) {
-        printf("[DEBUG myFSClose] ERRO: Descritor de arquivo inválido (%d)\n", fd);
-        return -1; // Descritor fora do intervalo válido
-    }
+	// Validar descritor de arquivo
+	if (idx < 0 || idx >= MAX_FDS)
+	{
+		printf("[DEBUG myFSClose] ERRO: Descritor de arquivo inválido (%d)\n", fd);
+		return -1; // Descritor fora do intervalo válido
+	}
 
-    if (!fdTable[idx].used) {
-        printf("[DEBUG myFSClose] ERRO: Descritor de arquivo não está em uso (%d)\n", fd);
-        return -1; // Descritor não está em uso
-    }
+	if (!fdTable[idx].used)
+	{
+		printf("[DEBUG myFSClose] ERRO: Descritor de arquivo não está em uso (%d)\n", fd);
+		return -1; // Descritor não está em uso
+	}
 
-    // Liberar recursos associados ao descritor
-    if (fdTable[idx].inode != NULL) {
-        free(fdTable[idx].inode); // Liberar memória do inode
-        fdTable[idx].inode = NULL;
-    }
+	// Liberar recursos associados ao descritor
+	if (fdTable[idx].inode != NULL)
+	{
+		free(fdTable[idx].inode); // Liberar memória do inode
+		fdTable[idx].inode = NULL;
+	}
 
-    // Marcar descritor como não usado
-    fdTable[idx].used = 0;
-    fdTable[idx].disk = NULL;
-    fdTable[idx].inodeNum = 0;
-    fdTable[idx].cursor = 0;
+	// Marcar descritor como não usado
+	fdTable[idx].used = 0;
+	fdTable[idx].disk = NULL;
+	fdTable[idx].inodeNum = 0;
+	fdTable[idx].cursor = 0;
 
-    printf("[DEBUG myFSClose] Sucesso: Descritor de arquivo fechado (%d)\n", fd);
-    return 0; // Sucesso
+	printf("[DEBUG myFSClose] Sucesso: Descritor de arquivo fechado (%d)\n", fd);
+	return 0; // Sucesso
 }
 
 // Funcao para abertura de um diretorio, a partir do caminho
@@ -697,7 +1009,8 @@ int installMyFS(void)
 	// printf("[DEBUG installMyFS] Iniciando instalacao...\n");
 
 	// Preencher struct estatica (persiste apos funcao retornar)
-	myFSInfo.fsid = 0;  // ID do filesystem (importante!)
+	// passando endereçp de todos pra não ficar ponteiro pendente
+	myFSInfo.fsid = 0; // ID do filesystem (importante!)
 	myFSInfo.fsname = "MyFS";
 	myFSInfo.isidleFn = myFSIsIdle;
 	myFSInfo.formatFn = myFSFormat;
@@ -713,13 +1026,15 @@ int installMyFS(void)
 	myFSInfo.closedirFn = myFSCloseDir;
 
 	// Verificar se o fsid é único
-	if (myFSInfo.fsid == 0) {
+	if (myFSInfo.fsid == 0)
+	{
 		printf("[DEBUG installMyFS] Aviso: fsid está definido como 0. Certifique-se de que não há conflito.\n");
 	}
 
 	// Registrar no VFS
 	int slot = vfsRegisterFS(&myFSInfo);
-	if (slot < 0) {
+	if (slot < 0)
+	{
 		printf("[DEBUG installMyFS] ERRO: vfsRegisterFS retornou %d. Registro falhou.\n", slot);
 		return -1;
 	}
