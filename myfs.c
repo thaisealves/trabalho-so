@@ -307,7 +307,31 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
-	return -1;
+    // Validar descritor de arquivo
+    if (fd < 0 || fd >= MAX_FDS) {
+        printf("[DEBUG myFSClose] ERRO: Descritor de arquivo inválido (%d)\n", fd);
+        return -1; // Descritor fora do intervalo válido
+    }
+
+    if (!fdTable[fd].used) {
+        printf("[DEBUG myFSClose] ERRO: Descritor de arquivo não está em uso (%d)\n", fd);
+        return -1; // Descritor não está em uso
+    }
+
+    // Liberar recursos associados ao descritor
+    if (fdTable[fd].inode != NULL) {
+        free(fdTable[fd].inode); // Liberar memória do inode
+        fdTable[fd].inode = NULL;
+    }
+
+    // Marcar descritor como não usado
+    fdTable[fd].used = 0;
+    fdTable[fd].disk = NULL;
+    fdTable[fd].inodeNum = 0;
+    fdTable[fd].cursor = 0;
+
+    printf("[DEBUG myFSClose] Sucesso: Descritor de arquivo fechado (%d)\n", fd);
+    return 0; // Sucesso
 }
 
 // Funcao para abertura de um diretorio, a partir do caminho
