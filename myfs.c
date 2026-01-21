@@ -19,6 +19,8 @@
 // Declaracoes globais
 // superbloco pro so saber onde estão as coisas
 #define MYFS_MAGIC 0x4D594653
+#define INODE_BEGINSECTOR 2     // Setor a partir do qual i-nodes são gravados
+#define INODE_SIZE 16           // Tamanho do i-node em numero de unsigned ints
 
 typedef struct
 {
@@ -54,9 +56,11 @@ int myFSIsIdle(Disk *d)
 	// Percorre a tabela de descritores procurando algum em uso neste disco
 	for (int i = 0; i < MAX_FDS; i++) {
 		if (fdTable[i].used && fdTable[i].disk == d) {
+			printf("[DEBUG myFSIsIdle] Descritor %d ainda em uso no disco %p\n", i, (void *)d);
 			return 0;  // Encontrou arquivo aberto, NAO esta ocioso
 		}
 	}
+	printf("[DEBUG myFSIsIdle] Sistema de arquivos está ocioso\n");
 	return 1;  // Nenhum arquivo aberto, sistema OCIOSO
 }
 
@@ -278,7 +282,53 @@ int myFSxMount(Disk *d, int x)
 // em caso de sucesso. Retorna -1, caso contrario.
 int myFSOpen(Disk *d, const char *path)
 {
-	return -1;
+    // Validar parametros
+    if (d == NULL || path == NULL || strlen(path) == 0) {
+        printf("[DEBUG myFSOpen] ERRO: Parâmetros inválidos\n");
+        return -1;
+    }
+
+    // Procurar um descritor livre na tabela
+    int fd = -1;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!fdTable[i].used) {
+            fd = i;
+            break;
+        }
+    }
+
+    if (fd == -1) {
+        printf("[DEBUG myFSOpen] ERRO: Tabela de descritores cheia\n");
+        return -1; // Sem espaço na tabela de descritores
+    }
+
+    // Criar ou localizar o inode do arquivo
+    printf("[DEBUG myFSOpen] Tentando carregar inode para o arquivo '%s'\n", path);
+    unsigned long inodeSectorAddr = INODE_BEGINSECTOR + (1 - 1) * INODE_SIZE * sizeof(unsigned int) / DISK_SECTORDATASIZE;
+    printf("[DEBUG myFSOpen] Calculado endereço do setor do inode: %lu\n", inodeSectorAddr);
+
+    Inode *inode = inodeLoad(1, d); // Exemplo: carregar inode 1 (ajustar lógica conforme necessário)
+    if (inode == NULL) {
+        printf("[DEBUG myFSOpen] Inode não encontrado. Tentando criar um novo inode para '%s'\n", path);
+        inode = inodeCreate(1, d); // Criar inode se não existir
+        if (inode == NULL) {
+            printf("[DEBUG myFSOpen] ERRO: Falha ao criar inode para '%s'\n", path);
+            return -1;
+        }
+        printf("[DEBUG myFSOpen] Sucesso: Inode criado para '%s'\n", path);
+    } else {
+        printf("[DEBUG myFSOpen] Sucesso: Inode carregado para '%s'\n", path);
+    }
+
+    // Preencher o descritor de arquivo
+    fdTable[fd].used = 1;
+    fdTable[fd].disk = d;
+    fdTable[fd].inodeNum = 1; // Exemplo: associar ao inode 1 (ajustar conforme necessário)
+    fdTable[fd].cursor = 0;
+    fdTable[fd].inode = inode;
+
+    printf("[DEBUG myFSOpen] Sucesso: Arquivo aberto com descritor %d (retornando %d)\n", fd, fd + 1);
+    return fd + 1; // Retornar fd+1 pois o sistema espera descritores > 0
 }
 
 // Funcao para a leitura de um arquivo, a partir de um descritor de arquivo
@@ -289,6 +339,15 @@ int myFSOpen(Disk *d, const char *path)
 // efetivamente lidos em caso de sucesso ou -1, caso contrario.
 int myFSRead(int fd, char *buf, unsigned int nbytes)
 {
+	// Converter descritor de 1-based para 0-based (índice da tabela)
+	int idx = fd - 1;
+
+	// Validar descritor
+	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+		return -1;
+	}
+
+	// TODO: Implementar leitura de arquivo
 	return -1;
 }
 
@@ -300,6 +359,15 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 // efetivamente escritos em caso de sucesso ou -1, caso contrario
 int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 {
+	// Converter descritor de 1-based para 0-based (índice da tabela)
+	int idx = fd - 1;
+
+	// Validar descritor
+	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+		return -1;
+	}
+
+	// TODO: Implementar escrita de arquivo
 	return -1;
 }
 
@@ -307,28 +375,31 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
+    // Converter descritor de 1-based para 0-based (índice da tabela)
+    int idx = fd - 1;
+
     // Validar descritor de arquivo
-    if (fd < 0 || fd >= MAX_FDS) {
+    if (idx < 0 || idx >= MAX_FDS) {
         printf("[DEBUG myFSClose] ERRO: Descritor de arquivo inválido (%d)\n", fd);
         return -1; // Descritor fora do intervalo válido
     }
 
-    if (!fdTable[fd].used) {
+    if (!fdTable[idx].used) {
         printf("[DEBUG myFSClose] ERRO: Descritor de arquivo não está em uso (%d)\n", fd);
         return -1; // Descritor não está em uso
     }
 
     // Liberar recursos associados ao descritor
-    if (fdTable[fd].inode != NULL) {
-        free(fdTable[fd].inode); // Liberar memória do inode
-        fdTable[fd].inode = NULL;
+    if (fdTable[idx].inode != NULL) {
+        free(fdTable[idx].inode); // Liberar memória do inode
+        fdTable[idx].inode = NULL;
     }
 
     // Marcar descritor como não usado
-    fdTable[fd].used = 0;
-    fdTable[fd].disk = NULL;
-    fdTable[fd].inodeNum = 0;
-    fdTable[fd].cursor = 0;
+    fdTable[idx].used = 0;
+    fdTable[idx].disk = NULL;
+    fdTable[idx].inodeNum = 0;
+    fdTable[idx].cursor = 0;
 
     printf("[DEBUG myFSClose] Sucesso: Descritor de arquivo fechado (%d)\n", fd);
     return 0; // Sucesso
