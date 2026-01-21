@@ -1,0 +1,9 @@
+# arquivos objeto
+*.o
+
+# executável
+simulador
+
+# arquivos temporários
+*~
+*.swp

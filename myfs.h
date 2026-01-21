@@ -1,7 +1,7 @@
 /*
 *  myfs.h - Funcao que permite a instalacao de seu sistema de arquivos no S.O.
 *
-*  Autor: SUPER_PROGRAMADORES C
+*  Autores: Hugo Ricardo Giles Nicolau - 202435003 e Thaíse Silva Alves - 202435038
 *  Projeto: Trabalho Pratico II - Sistemas Operacionais
 *  Organizacao: Universidade Federal de Juiz de Fora
 *  Departamento: Dep. Ciencia da Computacao
