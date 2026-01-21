@@ -342,13 +342,59 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	// Converter descritor de 1-based para 0-based (índice da tabela)
 	int idx = fd - 1;
 
+	printf("[DEBUG myFSRead] Iniciando leitura: fd=%d, idx=%d, nbytes=%u\n", fd, idx, nbytes);
+
 	// Validar descritor
 	if (idx < 0 || idx >= MAX_FDS || !fdTable[idx].used) {
+		printf("[DEBUG myFSRead] ERRO: Descritor inválido ou não usado\n");
 		return -1;
 	}
 
-	// TODO: Implementar leitura de arquivo
-	return -1;
+	// Validar buffer
+	if (buf == NULL || nbytes == 0) {
+		printf("[DEBUG myFSRead] ERRO: Buffer inválido ou nbytes = 0\n");
+		return -1;
+	}
+
+	// Obter informações do descritor
+	Inode *inode = fdTable[idx].inode;
+	if (inode == NULL) {
+		printf("[DEBUG myFSRead] ERRO: Inode não carregado\n");
+		return -1;
+	}
+
+	// Obter tamanho do arquivo (assumindo que está armazenado no inode)
+	unsigned int fileSize = inodeGetFileSize(inode);
+	unsigned int cursor = fdTable[idx].cursor;
+
+	printf("[DEBUG myFSRead] Tamanho do arquivo: %u bytes, cursor atual: %u\n", fileSize, cursor);
+
+	// Verificar se já chegamos ao fim do arquivo
+	if (cursor >= fileSize) {
+		printf("[DEBUG myFSRead] Fim do arquivo atingido\n");
+		return 0; // EOF
+	}
+
+	// Calcular quantos bytes podemos ler
+	unsigned int bytesToRead = nbytes;
+	if (cursor + bytesToRead > fileSize) {
+		bytesToRead = fileSize - cursor;
+	}
+
+	printf("[DEBUG myFSRead] Bytes a ler: %u\n", bytesToRead);
+
+	// Ler dados do inode
+	int bytesRead = inodeRead(inode, buf, cursor, bytesToRead);
+	if (bytesRead < 0) {
+		printf("[DEBUG myFSRead] ERRO: Falha ao ler dados do inode\n");
+		return -1;
+	}
+
+	// Atualizar cursor
+	fdTable[idx].cursor += bytesRead;
+
+	printf("[DEBUG myFSRead] Sucesso: %d bytes lidos, novo cursor: %u\n", bytesRead, fdTable[idx].cursor);
+	return bytesRead;
 }
 
 // Funcao para a escrita de um arquivo, a partir de um descritor de arquivo
