@@ -16,8 +16,22 @@
 #include "util.h"
 
 // Declaracoes globais
-//...
-//...
+// superbloco pro so saber onde estão as coisas
+#define MYFS_MAGIC 0x4D594653
+
+typedef struct
+{
+	unsigned int magic;		// identificador do sistema de arquivos
+	unsigned int blockSize; // bytes
+	unsigned int numBlocks;
+	unsigned int numInodes;
+	unsigned int inodeTableStart;
+	unsigned int dataBlockStart;
+	unsigned int freeBlockList;
+	Inode* rootInode; // diretorio raiz, inode
+} superblock;
+
+superblock sb;
 
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
@@ -33,7 +47,15 @@ int myFSIsIdle(Disk *d)
 // retorna -1.
 int myFSFormat(Disk *d, unsigned int blockSize)
 {
-	return -1;
+	sb.magic = MYFS_MAGIC;
+	sb.blockSize = blockSize;
+	sb.numBlocks = diskGetSize(d);
+	sb.rootInode = 0;
+
+	diskWrite(0, &sb);
+	return sb.numBlocks;
+
+
 }
 
 // Funcao para montagem/desmontagem do sistema de arquivos, se possível.
@@ -134,6 +156,7 @@ int myFSCloseDir(int fd)
 // ao virtual FS (vfs). Retorna um identificador unico (slot), caso
 // o sistema de arquivos tenha sido registrado com sucesso.
 // Caso contrario, retorna -1
+// envio o end. de todas as funcoes implementadas acima pro vfs ter onde buscar
 int installMyFS(void)
 {
 	FSInfo fsInfo = {
@@ -145,11 +168,6 @@ int installMyFS(void)
 		.readFn = myFSRead,
 		.writeFn = myFSWrite,
 		.closeFn = myFSClose,
-		.opendirFn = myFSOpenDir,
-		.readdirFn = myFSReadDir,
-		.linkFn = myFSLink,
-		.unlinkFn = myFSUnlink,
-		.closedirFn = myFSCloseDir
 	};
 
 	int slot = vfsRegisterFS(&fsInfo);
