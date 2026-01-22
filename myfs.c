@@ -36,10 +36,6 @@ typedef struct
 
 superblock sb;
 
-// Bitmaps para gerenciar recursos livres
-static unsigned char *blockBitmap = NULL;  // 1 bit por bloco (1=usado, 0=livre)
-static unsigned char *inodeBitmap = NULL;  // 1 bit por inode (1=usado, 0=livre)
-
 // Estrutura para descritor de arquivo aberto
 typedef struct
 {
@@ -90,35 +86,6 @@ static int addFileEntry(const char *path, unsigned int inodeNum)
 	return -1;
 }
 
-// Funcoes auxiliares para manipulacao de bitmap
-static void setBit(unsigned char *bitmap, unsigned int index)
-{
-	bitmap[index / 8] |= (1 << (index % 8));
-}
-
-static void clearBit(unsigned char *bitmap, unsigned int index)
-{
-	bitmap[index / 8] &= ~(1 << (index % 8));
-}
-
-static int getBit(unsigned char *bitmap, unsigned int index)
-{
-	return (bitmap[index / 8] >> (index % 8)) & 1;
-}
-
-// Encontra primeiro bit livre (0) no bitmap, retorna indice ou -1 se nenhum livre
-static int findFreeBit(unsigned char *bitmap, unsigned int maxBits)
-{
-	for (unsigned int i = 0; i < maxBits; i++)
-	{
-		if (!getBit(bitmap, i))
-		{
-			return i;
-		}
-	}
-	return -1;
-}
-
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
 // um positivo se ocioso ou, caso contrario, 0.
@@ -135,32 +102,55 @@ int myFSIsIdle(Disk *d)
 	return 1; // Nenhum arquivo aberto, sistema OCIOSO
 }
 
-// Funcao auxiliar para alocar um bloco livre no disco usando bitmap
+// Funcao auxiliar para alocar um bloco livre no disco usando free block list
 // Retorna o setor inicial do bloco alocado, ou 0 se nenhum bloco livre
 static unsigned int allocateFreeBlock(Disk *d)
 {
-	if (d == NULL || sb.magic != MYFS_MAGIC || blockBitmap == NULL)
+	if (d == NULL || sb.magic != MYFS_MAGIC)
 	{
-		printf("[DEBUG allocateFreeBlock] ERRO: Disco, superbloco ou bitmap inválido\n");
 		return 0;
 	}
 
-	unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
-	unsigned int dataBlockStart = sb.dataBlockStart;
-
-	// Buscar primeiro bloco livre no bitmap (O(n) mas em memória, sem I/O)
-	int freeBlockNum = findFreeBit(blockBitmap, sb.numBlocks);
-	if (freeBlockNum < 0)
+	// Verificar se ha blocos livres na lista
+	if (sb.freeBlockList == 0)
 	{
-		printf("[DEBUG allocateFreeBlock] ERRO: Nenhum bloco livre encontrado\n");
 		return 0;
 	}
 
-	// Marcar bloco como usado no bitmap
-	setBit(blockBitmap, freeBlockNum);
+	// O primeiro bloco livre esta em sb.freeBlockList
+	unsigned int freeBlock = sb.freeBlockList;
 
-	unsigned int blockSector = dataBlockStart + (freeBlockNum * sectorsPerBlock);
-	return blockSector;
+	// Ler o bloco livre para obter o proximo da lista
+	unsigned char buffer[DISK_SECTORDATASIZE];
+	if (diskReadSector(d, freeBlock, buffer) != 0)
+	{
+		return 0;
+	}
+
+	// O proximo bloco livre esta armazenado nos primeiros 4 bytes do bloco
+	unsigned int nextFree;
+	char2ul(buffer, &nextFree);
+
+	// Atualizar a cabeca da lista de blocos livres
+	sb.freeBlockList = nextFree;
+
+	// Salvar superbloco atualizado no disco
+	unsigned char sbBuffer[DISK_SECTORDATASIZE];
+	ul2char(sb.magic, &sbBuffer[0]);
+	ul2char(sb.blockSize, &sbBuffer[4]);
+	ul2char(sb.numBlocks, &sbBuffer[8]);
+	ul2char(sb.numInodes, &sbBuffer[12]);
+	ul2char(sb.inodeTableStart, &sbBuffer[16]);
+	ul2char(sb.dataBlockStart, &sbBuffer[20]);
+	ul2char(sb.freeBlockList, &sbBuffer[24]);
+	ul2char(sb.rootInode, &sbBuffer[28]);
+	for (int i = 32; i < DISK_SECTORDATASIZE; i++)
+	{
+		sbBuffer[i] = 0;
+	}
+	diskWriteSector(d, 0, sbBuffer);
+
+	return freeBlock;
 }
 
 // Funcao para formatacao de um disco com o novo sistema de arquivos
@@ -245,21 +235,52 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 		}
 	}
 
-	// PASSO 5: Inicializar bitmaps em memória
-	unsigned int bitmapBlockBytes = (numBlocks + 7) / 8;  // Arredondar para cima
-	unsigned int bitmapInodeBytes = (numInodes + 7) / 8;
+	// PASSO 5: Inicializar lista encadeada de blocos livres
+	// Cada bloco livre aponta para o proximo bloco livre (endereco nos primeiros 4 bytes)
+	// O ultimo bloco livre aponta para 0 (fim da lista)
+	unsigned char blockBuffer[DISK_SECTORDATASIZE];
+	memset(blockBuffer, 0, DISK_SECTORDATASIZE);
 
-	if (blockBitmap)
-		free(blockBitmap);
-	if (inodeBitmap)
-		free(inodeBitmap);
-
-	blockBitmap = (unsigned char *)calloc(bitmapBlockBytes, 1);
-	inodeBitmap = (unsigned char *)calloc(bitmapInodeBytes, 1);
-
-	if (blockBitmap == NULL || inodeBitmap == NULL)
+	for (unsigned int i = 0; i < numBlocks; i++)
 	{
-		printf("[DEBUG myFSFormat] ERRO: Falha ao alocar bitmaps\n");
+		unsigned int currentBlockSector = dataBlockStart + (i * sectorsPerBlock);
+		unsigned int nextBlockSector;
+
+		if (i < numBlocks - 1)
+		{
+			nextBlockSector = dataBlockStart + ((i + 1) * sectorsPerBlock);
+		}
+		else
+		{
+			nextBlockSector = 0; // Ultimo bloco, fim da lista
+		}
+
+		// Escrever ponteiro para proximo bloco livre nos primeiros 4 bytes
+		ul2char(nextBlockSector, blockBuffer);
+
+		if (diskWriteSector(d, currentBlockSector, blockBuffer) != 0)
+		{
+			printf("[DEBUG myFSFormat] ERRO ao inicializar bloco livre %u\n", i);
+			return -1;
+		}
+	}
+
+	// Atualizar superbloco com a cabeca da lista de blocos livres
+	sb.freeBlockList = dataBlockStart; // Primeiro bloco de dados e a cabeca
+
+	// Reescrever superbloco com freeBlockList atualizado
+	ul2char(sb.magic, &buffer[0]);
+	ul2char(sb.blockSize, &buffer[4]);
+	ul2char(sb.numBlocks, &buffer[8]);
+	ul2char(sb.numInodes, &buffer[12]);
+	ul2char(sb.inodeTableStart, &buffer[16]);
+	ul2char(sb.dataBlockStart, &buffer[20]);
+	ul2char(sb.freeBlockList, &buffer[24]);
+	ul2char(sb.rootInode, &buffer[28]);
+
+	if (diskWriteSector(d, 0, buffer) != 0)
+	{
+		printf("[DEBUG myFSFormat] ERRO: Falha ao reescrever superbloco\n");
 		return -1;
 	}
 
@@ -281,9 +302,6 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	{
 		return -1;
 	}
-
-	// Marcar inode 1 como usado no bitmap
-	setBit(inodeBitmap, 1);
 
 	unsigned int rootBlock = allocateFreeBlock(d);
 	if (rootBlock == 0)
@@ -378,58 +396,8 @@ int myFSxMount(Disk *d, int x)
 		// Limpar tabela de caminhos para que cada execucao comece sem lixo
 		memset(fileTable, 0, sizeof(fileTable));
 
-		// Alocar e reconstruir bitmaps a partir do disco
-		unsigned int bitmapBlockBytes = (sb.numBlocks + 7) / 8;
-		unsigned int bitmapInodeBytes = (sb.numInodes + 7) / 8;
-
-		if (blockBitmap)
-			free(blockBitmap);
-		if (inodeBitmap)
-			free(inodeBitmap);
-
-		blockBitmap = (unsigned char *)calloc(bitmapBlockBytes, 1);
-		inodeBitmap = (unsigned char *)calloc(bitmapInodeBytes, 1);
-
-		if (blockBitmap == NULL || inodeBitmap == NULL)
-		{
-			printf("[DEBUG myFSxMount] ERRO: Falha ao alocar bitmaps\n");
-			return 0;
-		}
-
-		// Reconstruir bitmaps escaneando inodes (feito apenas uma vez na montagem)
-		unsigned int sectorsPerBlock = sb.blockSize / DISK_SECTORDATASIZE;
-		unsigned int dataBlockStart = sb.dataBlockStart;
-
-		for (unsigned int inodeNum = 1; inodeNum <= sb.numInodes; inodeNum++)
-		{
-			Inode *checkInode = inodeLoad(inodeNum, d);
-			if (checkInode != NULL)
-			{
-				// Verificar se inode está em uso (tem pelo menos um bloco alocado)
-				unsigned int firstBlock = inodeGetBlockAddr(checkInode, 0);
-				if (firstBlock > 0)
-				{
-					// Marcar inode como usado
-					setBit(inodeBitmap, inodeNum);
-
-					// Marcar todos os blocos deste inode como usados
-					unsigned int numBlocksInInode = inodeNumBlockAddresses();
-					for (unsigned int i = 0; i < numBlocksInInode; i++)
-					{
-						unsigned int blockAddr = inodeGetBlockAddr(checkInode, i);
-						if (blockAddr > 0)
-						{
-							unsigned int blockNum = (blockAddr - dataBlockStart) / sectorsPerBlock;
-							if (blockNum < sb.numBlocks)
-							{
-								setBit(blockBitmap, blockNum);
-							}
-						}
-					}
-				}
-				free(checkInode);
-			}
-		}
+		// A lista de blocos livres ja esta persistida no disco (sb.freeBlockList)
+		// Inodes livres sao encontrados dinamicamente via inodeFindFreeInode()
 
 		return 1; // sucesso na montagem
 	}
@@ -458,18 +426,6 @@ int myFSxMount(Disk *d, int x)
 					fdTable[i].inode = NULL;
 				}
 			}
-		}
-
-		// Liberar bitmaps
-		if (blockBitmap)
-		{
-			free(blockBitmap);
-			blockBitmap = NULL;
-		}
-		if (inodeBitmap)
-		{
-			free(inodeBitmap);
-			inodeBitmap = NULL;
 		}
 
 		// Limpar superbloco para evitar inconsistencias
@@ -535,28 +491,28 @@ int myFSOpen(Disk *d, const char *path)
 	}
 	else
 	{
-		// Alocar um novo inode livre usando bitmap (pular inode 0 e 1)
-		int freeInode = -1;
-		for (unsigned int i = 2; i <= sb.numInodes; i++)
-		{
-			if (!getBit(inodeBitmap, i))
-			{
-				freeInode = i;
-				break;
-			}
-		}
-
-		if (freeInode < 0)
+		// Alocar um novo inode livre usando inodeFindFreeInode (pular inode 1 que e raiz)
+		inodeNum = inodeFindFreeInode(2, d);
+		if (inodeNum == 0)
 		{
 			printf("[DEBUG myFSOpen] ERRO: Nenhum inode livre disponível para '%s'\n", path);
 			return -1;
 		}
 
-		inodeNum = freeInode;
+		// IMPORTANTE: Alocar bloco ANTES de criar o inode
+		// Porque inodeCreate zera o inode, e inodeFindFreeInode verifica se bloco[0] == 0
+		unsigned int firstBlock = allocateFreeBlock(d);
+		if (firstBlock == 0)
+		{
+			printf("[DEBUG myFSOpen] ERRO: Nenhum bloco livre para '%s'\n", path);
+			return -1;
+		}
+
 		inode = inodeCreate(inodeNum, d);
 		if (inode == NULL)
 		{
 			printf("[DEBUG myFSOpen] ERRO: Falha ao criar inode %u para '%s'\n", inodeNum, path);
+			// TODO: devolver bloco para a free list
 			return -1;
 		}
 
@@ -565,17 +521,11 @@ int myFSOpen(Disk *d, const char *path)
 		inodeSetOwner(inode, 0);
 		inodeSetGroupOwner(inode, 0);
 		inodeSetPermission(inode, 0644);
-		unsigned int firstBlock = allocateFreeBlock(d);
-		if (firstBlock == 0)
-		{
-			free(inode);
-			return -1;
-		}
 
-		inodeAddBlock(inode, firstBlock);
-		if (inodeSave(inode) != 0)
+		// Adicionar bloco ao inode (inodeAddBlock salva automaticamente)
+		if (inodeAddBlock(inode, firstBlock) != 0)
 		{
-			printf("[DEBUG myFSOpen] ERRO: Falha ao salvar inode %u para '%s'\n", inodeNum, path);
+			printf("[DEBUG myFSOpen] ERRO: Falha ao adicionar bloco ao inode %u\n", inodeNum);
 			free(inode);
 			return -1;
 		}
@@ -586,8 +536,6 @@ int myFSOpen(Disk *d, const char *path)
 			free(inode);
 			return -1;
 		}
-		// Marcar inode como usado no bitmap
-		setBit(inodeBitmap, inodeNum);
 	}
 
 	// Preencher o descritor de arquivo
@@ -596,6 +544,8 @@ int myFSOpen(Disk *d, const char *path)
 	fdTable[fd].inodeNum = inodeNum;
 	fdTable[fd].cursor = 0;
 	fdTable[fd].inode = inode;
+
+	printf("[DEBUG myFSOpen] Arquivo '%s' aberto: FD=%d, inode=%u\n", path, fd + 1, inodeNum);
 
 	return fd + 1; // Retornar fd+1 pois o sistema espera descritores > 0
 }
